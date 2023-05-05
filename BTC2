@@ -1,0 +1,619 @@
+import tensorflow as tf
+
+tf.config.run_functions_eagerly(True)
+
+tf.data.experimental.enable_debug_mode()
+
+import ccxt
+
+import ta
+
+import time
+
+import pytz
+
+import pandas as pd
+
+import numpy as np
+
+import matplotlib.pyplot as plt
+
+from binance.client import Client
+
+from binance.enums import *
+
+from sklearn.preprocessing import MinMaxScaler
+
+from tensorflow.keras.models import Sequential
+
+from tensorflow.keras.layers import Dense, LSTM, Bidirectional
+
+from datetime import datetime
+
+from tqdm.notebook import tqdm
+
+from tensorflow.keras.layers import Flatten
+
+from ta.momentum import RSIIndicator
+
+from datetime import datetime, timedelta
+
+from tensorflow.keras.layers import Dropout
+
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
+
+from tensorflow.keras.layers import SimpleRNN
+
+from tensorflow.keras.layers import BatchNormalization
+
+from tensorflow.keras.optimizers import Adam
+
+from matplotlib.dates import DateFormatter
+
+from keras.layers import GRU
+
+import matplotlib.pyplot as plt
+
+from ta.momentum import StochRSIIndicator
+
+from sklearn.metrics import r2_score
+
+# Definição dos parâmetros
+
+PAIR = 'BTC/USDT'
+
+BATCH_SIZE = 25   #25 <---ideal
+
+EPOCHS = 23    #20 <---ideal
+
+INTERVAL = '1h'  # intervalo de 1 HORA
+
+LSTM_WINDOW = 60 # janela de 60 dias para a LSTM
+
+LIMIT = 1000  # limite de 1000 barras (máximo permitido)
+
+input_dim = 7
+
+data_range = timedelta(days=180)
+
+# Define o fuso horário para o horário de Brasília
+
+brasil_tz = pytz.timezone('America/Sao_Paulo')
+
+# Configurações
+
+exchange_name = 'coinbasepro'  # Use 'binance', 'kraken', 'coinbasepro', etc.
+
+pair = 'BTC/USDT'  # Par de moedas
+
+interval = '1h'  # Intervalo das velas
+
+# Criando a conexão com a exchange
+
+exchange = getattr(ccxt, exchange_name)()
+
+# Converte as datas para timestamp em milissegundos
+
+# Define o período de busca dos dados
+
+fim_dt = datetime.now()
+
+inicio_dt = fim_dt - data_range
+
+# Converte as datas para timestamp em milissegundos
+
+inicio_ts = int(inicio_dt.timestamp() * 1000)
+
+fim_ts = int(fim_dt.timestamp() * 1000)
+
+# Cria uma lista vazia para armazenar todos os dados
+
+all_data = []
+
+# Calcula a diferença em horas
+
+total_hours = int((fim_dt - inicio_dt).total_seconds() / 3600)
+
+print ("BUSCANDO DADOS BTC-USD ...")
+
+# Inicializa a barra de progresso
+
+pbar = tqdm(total=total_hours)
+
+while inicio_ts < fim_ts:
+
+    # Busca os dados
+
+    data = exchange.fetch_ohlcv(pair, interval, since=inicio_ts)
+
+    # Se não retornar dados, sai do loop
+
+    if not data:
+
+        break
+
+    # Adiciona os dados à nossa lista
+
+    all_data += data
+
+    # Atualiza o timestamp de início para o timestamp da última vela + intervalo
+
+    inicio_ts = data[-1][0] + 1
+
+    # Atualiza a barra de progresso
+
+    pbar.update(len(data))
+
+    # Pausa para evitar atingir o limite de requisições da API
+
+    time.sleep(exchange.rateLimit / 1000)
+
+pbar.close()
+
+print('\033[32m' + "Número total de velas coletadas: " + str(len(all_data)) + '\033[0m')
+
+klines=all_data
+
+df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
+df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert(brasil_tz)
+
+df['open'] = pd.to_numeric(df['open'])
+
+df['high'] = pd.to_numeric(df['high'])
+
+df['low'] = pd.to_numeric(df['low'])
+
+df['close'] = pd.to_numeric(df['close'])
+
+df['volume'] = pd.to_numeric(df['volume'])
+
+df = df[['timestamp', 'open', 'high', 'low', 'close','volume']]
+
+# Calcular as partes do indicador Ichimoku Kinko Hyo
+
+df['tenkan_sen'] = (df['high'].rolling(window=9).max() + df['low'].rolling(window=9).min()) / 2
+
+df['kijun_sen'] = (df['high'].rolling(window=26).max() + df['low'].rolling(window=26).min()) / 2
+
+df['senkou_span_a'] = ((df['tenkan_sen'] + df['kijun_sen']) / 2).shift(26)
+
+df['senkou_span_b'] = ((df['high'].rolling(window=52).max() + df['low'].rolling(window=52).min()) / 2).shift(26)
+
+df['chikou_span'] = df['close'].shift(-26)
+
+# Identificar padrões Ichimoku Kinko Hyo
+
+df['above_cloud'] = (df['close'] > df['senkou_span_a']) & (df['close'] > df['senkou_span_b'])
+
+df['below_cloud'] = (df['close'] < df['senkou_span_a']) & (df['close'] < df['senkou_span_b'])
+
+df['tenkan_kijun_cross'] = (df['tenkan_sen'] > df['kijun_sen']).shift(1) & (df['tenkan_sen'] < df['kijun_sen'])
+
+df.dropna(inplace=True)
+
+df_original = df.copy()
+
+# Seleciona apenas as colunas relevantes e converte em um array NumPy
+
+#data = df[['close']].to_numpy()
+
+# Calcular Volatilidade
+
+df['return'] = np.log(df['close'] / df['close'].shift(1))
+
+df['return'].std()
+
+# Crie um novo scaler para a coluna 'Volatilidade'
+
+scaler_volat = MinMaxScaler()
+
+df[['return']] = scaler_volat.fit_transform(df[['return']].values)
+
+# Calculando o StochRSI
+
+stochrsi_indicator = StochRSIIndicator(close=df['close'], window=14)
+
+stochrsi = stochrsi_indicator.stochrsi()
+
+df['StochRSI'] = stochrsi
+
+# Crie um novo scaler para a coluna 'StochRSI'
+
+scaler_srsi = MinMaxScaler()
+
+df[['StochRSI']] = scaler_srsi.fit_transform(df[['StochRSI']].values)
+
+# Calcular o indicador técnico RSI
+
+rsi_indicator = RSIIndicator(close = df['close'], window = 14)
+
+df['RSI'] = rsi_indicator.rsi()
+
+macd_indicator = ta.trend.MACD(df['close'], window_slow=26, window_fast=12, window_sign=9)
+
+df['MACD'] = macd_indicator.macd()
+
+# Calcule o OBV
+
+df['obv'] = ta.volume.on_balance_volume(df['close'], df['volume'])
+
+# Remove os valores NaN do DataFrame
+
+df = df.dropna().reset_index(drop=True)
+
+# Excluir as primeiras linhas que não têm RSI calculadodf = df.dropna().reset_index(drop=True)
+
+print("Número de pontos de dados após remover NaNs: ", len(df))
+
+# Crie um novo scaler para a coluna 'close'
+
+scaler_close = MinMaxScaler()
+
+df[['close']] = scaler_close.fit_transform(df[['close']].values)
+
+# Crie um novo scaler para a coluna 'RSI'
+
+scaler_rsi = MinMaxScaler()
+
+df[['RSI']] = scaler_rsi.fit_transform(df[['RSI']].values)
+
+# Cria um novo scaler para a coluna 'MACD'
+
+scaler_macd = MinMaxScaler()
+
+df[['MACD']] = scaler_macd.fit_transform(df[['MACD']].values)
+
+# Incluir 'high', 'low' e 'open' na normalização
+
+scaler_open = MinMaxScaler()
+
+scaler_high = MinMaxScaler()
+
+scaler_low = MinMaxScaler()
+
+df[['open']] = scaler_open.fit_transform(df[['open']].values)
+
+df[['high']] = scaler_high.fit_transform(df[['high']].values)
+
+df[['low']] = scaler_low.fit_transform(df[['low']].values)
+
+# Cria um novo scaler para a coluna 'OBV'
+
+scaler_obv = MinMaxScaler()
+
+df[['obv']] = scaler_obv.fit_transform(df[['obv']].values)
+
+# Cria um novo scaler para a coluna 'Volume'
+
+scaler_vlm = MinMaxScaler()
+
+df[['volume']] = scaler_vlm.fit_transform(df[['volume']].values)
+
+data = df[['open', 'high', 'low', 'close', 'StochRSI', 'return', 'volume']].to_numpy()
+
+#print(df.head())
+
+def create_sequences(data, window):
+
+    xs = []
+
+    ys = []
+
+    for i in range(window, len(data)):
+
+        xs.append(data[i-window:i])
+
+        ys.append(data[i, 0])  # seleciona apenas o preço de fechamento como alvo
+
+    return np.array(xs), np.array(ys)
+
+# Calcula a quantidade de dias para a previsão
+
+dias_prev = 1
+
+# Calcula o índice onde os dados de treinamento devem terminar e os dados de teste devem começar
+
+train_size = int(len(data) * 0.8)
+
+test_size = len(data) - train_size
+
+# Divide os dados em conjuntos de treinamento e teste
+
+train_data = data[:train_size]
+
+test_data = data[train_size:] # subtraímos LSTM_WINDOW para ter uma sequência completa para o primeiro ponto de teste
+
+# Cria as sequências de treinamento e teste
+
+x_train, y_train = create_sequences(train_data, LSTM_WINDOW)
+
+x_test, y_test = create_sequences(test_data, LSTM_WINDOW)
+
+# Redimensiona os arrays para terem a forma correta para a LSTM
+
+x_train = x_train.reshape((x_train.shape[0], x_train.shape[1], 7))
+
+x_test = x_test.reshape((x_test.shape[0], x_test.shape[1], 7))
+
+# Cria modelo GRU
+
+learning_rate = 0.00007
+
+num_units = 256
+
+num_layers = 3
+
+activation = 'tanh'
+
+optimizer = 'Adam'
+
+model = Sequential()
+
+model.add(GRU(units=num_units, return_sequences=True, activation=activation, input_shape=(LSTM_WINDOW, input_dim)))
+
+model.add(BatchNormalization())
+
+model.add(Dropout(0.1))
+
+for i in range(num_layers-1):
+
+    model.add(GRU(units=num_units, return_sequences=True, activation=activation))
+
+    model.add(BatchNormalization())
+
+    model.add(Dropout(0.1))
+
+model.add(GRU(units=num_units, activation=activation))
+
+optimizer = tf.keras.optimizers.Adam(learning_rate)
+
+model.summary()
+
+print("TREINANDO A REDE NEURAL ...")
+
+# Adiciona os callbacks
+
+early_stop = EarlyStopping(monitor='val_loss', patience=3)
+
+# Compila e treina o modelo com EarlyStopping
+
+model.compile(optimizer=Adam(learning_rate), loss='mean_squared_error')
+
+history = model.fit(
+
+    x_train,
+
+    y_train,
+
+    batch_size=BATCH_SIZE,
+
+    epochs=EPOCHS,
+
+    validation_data=(x_test, y_test),
+
+    verbose=1,
+
+    callbacks=[early_stop],
+
+)
+
+plt.plot(history.history['loss'], label='train')
+
+plt.plot(history.history['val_loss'], label='validation')
+
+plt.title('Model Loss')
+
+plt.xlabel('Epoch')
+
+plt.ylabel('Loss')
+
+plt.legend()
+
+plt.show()
+
+print ("CALCULANDO AS PREVISOES PARA O PROXIMO DIA...")
+
+# Faz a previsão dos valores do par de negociação para os próximos dias_prev dias
+
+# Faz a previsão dos valores do par de negociação para os próximos dias_prev dias
+
+predicted_values = []
+
+# atualiza last_sequence
+
+last_sequence = x_test[-1]
+
+for i in range(dias_prev * 24):  # prevendo os próximos "dias_prev" dias, hora a hora
+
+    predicted_value = model.predict(np.array([last_sequence]))
+
+    predicted_values.append(predicted_value[0][0])
+
+    last_sequence = np.roll(last_sequence, -1, axis=0)
+
+    last_sequence[-1, 3] = predicted_value[0][0]  # Atualiza o valor de 'close' na sequência com o último valor previsto
+
+    if i >= len(y_test):
+
+        last_sequence[-1, 3] = predicted_value[0][0]  # Usa o último valor previsto para datas futuras
+
+    else:
+
+        last_sequence[-1, 3] = y_test[i]  # Insere o valor real no lugar do valor previsto para datas futuras
+
+# Reverte a normalização
+
+predicted_values = np.array(predicted_values).reshape(-1, 1)
+
+predicted_values = scaler_close.inverse_transform(predicted_values)
+
+y_test = y_test.reshape(-1, 1)
+
+y_test = scaler_close.inverse_transform(y_test)
+
+# Cria uma lista com as datas correspondentes à previsão
+
+prev_dates = pd.date_range(start=df_original['timestamp'].iloc[-1] + timedelta(hours=1), periods=dias_prev * 24, freq='H').tolist()
+
+# Cria um DataFrame para exibir os valores previstos e os valores reais dos últimos dias
+
+print(f"Tamanho dos arrays - previsto: {len(predicted_values)} / real: {len(y_test)}")
+
+df_prev = pd.DataFrame({'timestamp': prev_dates, 'Valor Previsto': predicted_values.ravel()})
+
+print(df_prev)
+
+# Define o número de horas de dados reais para plotar
+
+real_data_hours = 72  # Altere este valor de acordo com suas necessidades
+
+# Cria o gráfico
+
+fig, ax = plt.subplots(figsize=(12, 8))
+
+# Plot dos valores de 'close' das últimas real_data_hours horas
+
+last_hours = df_original.iloc[-real_data_hours:]
+
+ax.plot(last_hours['timestamp'], last_hours['close'], color='blue', linewidth=1.5)
+
+# Plot dos valores previstos das próximas 24 horas
+
+predicted_values = df_prev['Valor Previsto']
+
+ax.plot(df_prev['timestamp'], predicted_values, linestyle='--', color='red')
+
+# Combine os valores reais e previstos em uma única lista
+
+all_values = np.concatenate([df_original['close'].tail(real_data_hours).values, predicted_values.ravel()])
+
+# Calcule o percentil 5 e o percentil 95
+
+lower_limit = np.percentile(all_values, 0)
+
+upper_limit = np.percentile(all_values, 100)
+
+# Defina o intervalo do eixo Y para incluir os limites inferior e superior
+
+ax.set_ylim(lower_limit, upper_limit)
+
+# Configurações do gráfico
+
+ax.set_ylabel('Preço')
+
+ax.set_title('Previsão do preço do par de negociação')
+
+# Define o intervalo do eixo x para mostrar as últimas real_data_hours horas e as próximas 24 horas
+
+last_hours_range = pd.date_range(end=df_prev['timestamp'].iloc[-1], periods=real_data_hours+24, freq='H')
+
+ax.set_xlim(last_hours_range[0], last_hours_range[-1])
+
+# Encontre o valor máximo e mínimo e seus respectivos índices
+
+max_value = predicted_values.max()
+
+max_idx = predicted_values.idxmax()
+
+min_value = predicted_values.min()
+
+min_idx = predicted_values.idxmin()
+
+# Anote o valor máximo e mínimo no gráfico
+
+ax.annotate('Max: {:.2f}'.format(max_value), xy=(df_prev['timestamp'][max_idx], max_value), 
+
+            xytext=(df_prev['timestamp'][max_idx], max_value+5),
+
+            arrowprops=dict(facecolor='green', shrink=0.05))
+
+ax.annotate('Min: {:.2f}'.format(min_value), xy=(df_prev['timestamp'][min_idx], min_value), 
+
+            xytext=(df_prev['timestamp'][min_idx], min_value-5),
+
+            arrowprops=dict(facecolor='red', shrink=0.05))
+
+last_hours = df_original.iloc[-real_data_hours:]
+
+# Adiciona as linhas de Ichimoku no gráfico
+
+ax.plot(last_hours['timestamp'], last_hours['tenkan_sen'], label='Tenkan Sen', color='blue', linewidth=1, linestyle='--')
+
+ax.plot(last_hours['timestamp'], last_hours['kijun_sen'], label='Kijun Sen', color='red', linewidth=1, linestyle='--')
+
+ax.plot(last_hours['timestamp'], last_hours['senkou_span_a'], label='Senkou Span A', color='green', linewidth=1, linestyle='--')
+
+ax.plot(last_hours['timestamp'], last_hours['senkou_span_b'], label='Senkou Span B', color='orange', linewidth=1, linestyle='--')
+
+# Adiciona o preenchimento da nuvem Ichimoku (Kumo)
+
+ax.fill_between(last_hours['timestamp'], last_hours['senkou_span_a'], last_hours['senkou_span_b'], where=(last_hours['senkou_span_a'] >= last_hours['senkou_span_b']), facecolor='lightgray', interpolate=True)
+
+ax.fill_between(last_hours['timestamp'], last_hours['senkou_span_a'], last_hours['senkou_span_b'], where=(last_hours['senkou_span_a'] < last_hours['senkou_span_b']), facecolor='lightgray', interpolate=True)
+
+# Seleciona apenas os últimos 5 padrões ishi
+
+last_5_above_cloud = df[df['above_cloud']].tail(5)
+
+last_5_below_cloud = df[df['below_cloud']].tail(5)
+
+last_5_tenkan_kijun_cross = df[df['tenkan_kijun_cross']].tail(5)
+
+# Concatena os últimos 5 padrões ishi selecionados
+
+last_5_ishi = pd.concat([last_5_above_cloud, last_5_below_cloud, last_5_tenkan_kijun_cross])
+
+# Reseta o índice para um índice numérico sequencial
+
+last_5_ishi = last_5_ishi.reset_index()
+
+# Seleciona os últimos 5 padrões Ishimoku Kinko Hyo acima da nuvem
+
+last_5_above_cloud = last_hours[last_hours['above_cloud']].tail(5)
+
+# Seleciona os últimos 5 padrões Ishimoku Kinko Hyo abaixo da nuvem
+
+last_5_below_cloud = last_hours[last_hours['below_cloud']].tail(5)
+
+# Seleciona os últimos 5 cruzamentos de Tenkan-sen/Kijun-sen
+
+last_5_tenkan_kijun_cross = last_hours[last_hours['tenkan_kijun_cross']].tail(5)
+
+plt.legend()
+
+# Anota os últimos 5 candles acima da nuvem
+
+for i in last_5_above_cloud.index:
+
+    plt.annotate('Acima da Nuvem', xy=(last_5_above_cloud.loc[i, 'timestamp'], last_5_above_cloud.loc[i, 'close']),
+
+                 xytext=(last_5_above_cloud.loc[i, 'timestamp'], last_5_above_cloud.loc[i, 'close'] + 10),
+
+                 arrowprops=dict(facecolor='green', shrink=0.05))
+
+# Anota os últimos 5 candles abaixo da nuvem
+
+for i in last_5_below_cloud.index:
+
+    plt.annotate('Abaixo da Nuvem', xy=(last_5_below_cloud.loc[i, 'timestamp'], last_5_below_cloud.loc[i, 'close']),
+
+                 xytext=(last_5_below_cloud.loc[i, 'timestamp'], last_5_below_cloud.loc[i, 'close'] - 10),
+
+                 arrowprops=dict(facecolor='red', shrink=0.05))
+
+# Anota os últimos 5 padrões Ishimoku Kinko Hyo no gráfico
+
+for i in last_5_ishi.index:
+
+    plt.annotate('Padrão Ishimoku Kinko Hyo', xy=(last_5_ishi.loc[i, 'timestamp'], last_5_ishi.loc[i, 'close']),
+
+                 xytext=(last_5_ishi.loc[i, 'timestamp'], last_5_ishi.loc[i, 'close'] + 10),
+
+                 arrowprops=dict(facecolor='purple', shrink=0.05))
+
+# Mostra o gráfico
+
+plt.show()
